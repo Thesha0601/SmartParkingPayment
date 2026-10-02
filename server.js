@@ -388,7 +388,24 @@ app.post("/webhook", async (req, res) =>
     });
 });
 
+// =====================================================
+// RESET PAYMENT FOR DEMO
+// =====================================================
 
+app.get("/reset-payment", async (req, res) => {
+    try {
+        await updateBlynk("v18", "UNPAID");
+        await updateBlynk("v20", "EXPIRED");
+        await updateBlynk("v21", "26/08/2026");
+
+        console.log("Payment reset to UNPAID");
+
+        res.send("Payment reset successfully: UNPAID / EXPIRED");
+    } catch (error) {
+        console.error("Reset payment error:", error);
+        res.status(500).send("Failed to reset payment");
+    }
+});
 // =====================================================
 // TEST BLYNK CONNECTION
 // =====================================================
