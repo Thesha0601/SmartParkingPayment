@@ -398,7 +398,16 @@ app.get("/reset-payment", async (req, res) => {
         await updateBlynk("v20", "EXPIRED");
         await updateBlynk("v21", "26/08/2026");
 
+        // Send permit expired notification
+        const eventUrl =
+            `https://blynk.cloud/external/api/logEvent?token=${BLYNK_AUTH_TOKEN}` +
+            `&code=permit_expired` +
+            `&description=${encodeURIComponent("Parking permit has expired. Please renew your monthly permit.")}`;
+
+        const response = await fetch(eventUrl);
+
         console.log("Payment reset to UNPAID");
+        console.log("Permit expired notification sent");
 
         res.send("Payment reset successfully: UNPAID / EXPIRED");
     } catch (error) {
