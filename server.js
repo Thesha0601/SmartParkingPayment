@@ -314,5 +314,16 @@ app.listen(PORT, async () =>
     console.log("Server running on port " + PORT);
     console.log("================================");
 
+    try {
+        const snapshot = await db
+            .ref("employees")
+            .child(EMPLOYEE_UID)
+            .once("value");
 
+        console.log("FIREBASE EMPLOYEE CHECK:", snapshot.exists());
+        console.log("FIREBASE EMPLOYEE DATA:", snapshot.val());
+
+    } catch (error) {
+        console.error("FIREBASE READ ERROR:", error.message);
+    }
 });
