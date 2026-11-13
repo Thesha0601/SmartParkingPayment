@@ -8,7 +8,9 @@ const Stripe = require("stripe");
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
-
+app.get("/", (req, res) => {
+    res.send("Smart Parking Payment Backend is running.");
+});
 // =====================================================
 // FIREBASE CONNECTION
 // =====================================================
