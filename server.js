@@ -307,6 +307,7 @@ app.use(express.json());
 // =====================================================
 const PORT = process.env.PORT || 4242;
 
+
 app.listen(PORT, async () => 
 {
     console.log("================================");
@@ -322,6 +323,12 @@ app.listen(PORT, async () =>
 
         console.log("FIREBASE EMPLOYEE CHECK:", snapshot.exists());
         console.log("FIREBASE EMPLOYEE DATA:", snapshot.val());
+
+        // NEW ROOT DATABASE TEST
+        const rootSnapshot = await db.ref("/").once("value");
+
+        console.log("ROOT DATABASE EXISTS:", rootSnapshot.exists());
+        console.log("ROOT EMPLOYEES:", rootSnapshot.child("employees").val());
 
     } catch (error) {
         console.error("FIREBASE READ ERROR:", error.message);
