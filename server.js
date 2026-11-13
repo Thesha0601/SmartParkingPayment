@@ -1,7 +1,8 @@
 require("dotenv").config();
 
 const express = require("express");
-const admin = require("firebase-admin");
+const { cert, initializeApp } = require("firebase-admin/app");
+const { getDatabase } = require("firebase-admin/database");
 const Stripe = require("stripe");
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -16,12 +17,12 @@ const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
     ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
     : require("./serviceAccountKey.json");
 
-admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
+const firebaseApp = initializeApp({
+    credential: cert(serviceAccount),
     databaseURL: "https://smartparkingemployeeapp-default-rtdb.asia-southeast1.firebasedatabase.app"
 });
 
-const db = admin.database();
+const db = getDatabase(firebaseApp);
 
 // =====================================================
 // EMPLOYEE PAYMENT SETTINGS
