@@ -1,461 +1,315 @@
+require("dotenv").config();
+
 const express = require("express");
+const admin = require("firebase-admin");
+const Stripe = require("stripe");
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 
 // =====================================================
-// STRIPE
+// FIREBASE CONNECTION
 // =====================================================
 
+const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
+    ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+    : require("./serviceAccountKey.json");
+
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: "https://smartparkingemployeeapp-default-rtdb.asia-southeast1.firebasedatabase.app"
+});
+
+const db = admin.database();
 
 // =====================================================
-// BLYNK
+// EMPLOYEE PAYMENT SETTINGS
 // =====================================================
 
-const BLYNK_AUTH_TOKEN = process.env.BLYNK_AUTH_TOKEN;
-
-
+const EMPLOYEE_UID = "B3 9E 68 10";
+const MONTHLY_FEE_SEN = 5000;
 
 
 // =====================================================
-// EXPRESS
+// GET CURRENT MALAYSIA DATE
+// =====================================================
+
+function getMalaysiaDate()
+{
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kuala_Lumpur",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+    }).formatToParts(new Date());
+
+    const values = {};
+
+    for (const part of parts)
+    {
+        values[part.type] = part.value;
+    }
+
+    return `${values.year}-${values.month}-${values.day}`;
+}
+
+
+// =====================================================
+// ADD ONE CALENDAR MONTH
+// =====================================================
+
+function addOneMonth(dateString)
+{
+    const [year, month, day] =
+        dateString.split("-").map(Number);
+
+    const nextMonth = month === 12 ? 1 : month + 1;
+
+    const nextYear = month === 12 ? year + 1 : year;
+
+    const lastDay = new Date(
+        Date.UTC(nextYear, nextMonth, 0)
+    ).getUTCDate();
+
+    const finalDay = Math.min(day, lastDay);
+
+    return `${nextYear}-${String(nextMonth).padStart(2, "0")}-${String(finalDay).padStart(2, "0")}`;
+}
+
+// =====================================================
+// STRIPE WEBHOOK - RAW BODY
+// =====================================================
+
+app.post(
+    "/webhook",
+    express.raw({ type: "application/json" }),
+    async (req, res) => {
+
+        let event;
+
+        try {
+            const signature = req.headers["stripe-signature"];
+
+            event = stripe.webhooks.constructEvent(
+                req.body,
+                signature,
+                process.env.STRIPE_WEBHOOK_SECRET
+            );
+
+        } catch (error) {
+            console.error("Stripe webhook verification failed:", error.message);
+
+            return res.status(400).send(
+                `Webhook Error: ${error.message}`
+            );
+        }
+
+        console.log("Verified Stripe event:", event.type);
+
+       
+        // =====================================================
+        // PROCESS SUCCESSFUL STRIPE PAYMENT
+        // =====================================================
+
+        try
+        {
+            // Only process completed Checkout Sessions
+
+            if (event.type !== "checkout.session.completed")
+            {
+                return res.json({ received: true });
+            }
+
+            const session = event.data.object;
+
+            // Check successful payment
+
+            if (session.payment_status !== "paid")
+            {
+                console.log("Payment is not completed yet.");
+                return res.json({ received: true });
+            }
+
+            // Check payment mode and amount
+
+            if (
+                session.mode !== "payment" ||
+                session.amount_total !== MONTHLY_FEE_SEN ||
+                session.currency !== "myr"
+            )
+            {
+                console.error("Payment amount or currency is incorrect.");
+
+                return res.status(400).send(
+                    "Invalid payment amount or currency"
+                );
+            }
+
+            // Get employee and payment information
+
+            const today = getMalaysiaDate();
+
+            const notificationKey =
+                db.ref("notifications").push().key;
+
+            const timestamp = Date.now();
+
+            // Update Firebase safely
+
+            const result = await db.ref().transaction(
+                (data) =>
+                {
+                    if (!data)
+                    {
+                        return;
+                    }
+
+                    data.processedStripeEvents =
+                        data.processedStripeEvents || {};
+
+                    // Prevent duplicate payment processing
+
+                    if (data.processedStripeEvents[event.id])
+                    {
+                        return;
+                    }
+
+                    const employee =
+                        data.employees?.[EMPLOYEE_UID];
+
+                    if (!employee)
+                    {
+                        return;
+                    }
+
+                    // Check whether existing permit is active
+
+                    const isActive =
+                        employee.permitStatus === "ACTIVE" &&
+                        typeof employee.expiryDate === "string" &&
+                        employee.expiryDate >= today;
+
+                    // Decide the starting date
+
+                    const baseDate = isActive
+                        ? employee.expiryDate
+                        : today;
+
+                    // Calculate new expiry date
+
+                    const newExpiryDate =
+                        addOneMonth(baseDate);
+
+                    // Update employee information
+
+                    employee.paymentStatus = "PAID";
+                    employee.permitStatus = "ACTIVE";
+                    employee.expiryDate = newExpiryDate;
+                    employee.lastPaymentDate = today;
+                    employee.updatedAt = timestamp;
+
+                    // Create payment notification
+
+                    data.notifications =
+                        data.notifications || {};
+
+                    data.notifications[notificationKey] = {
+                        employeeUID: EMPLOYEE_UID,
+                        type: "PAYMENT_SUCCESS",
+                        message: "Your RM50 monthly parking payment was successful. Your permit is now active.",
+                        date: today,
+                        timestamp: timestamp
+                    };
+
+                    // Record processed Stripe event
+
+                    data.processedStripeEvents[event.id] = {
+                        checkoutSessionId: session.id,
+                        processedAt: timestamp
+                    };
+
+                    return data;
+                },
+                undefined,
+                false
+            );
+
+            // Check transaction result
+
+            if (!result.committed)
+            {
+                const processedSnapshot =
+                    await db.ref(
+                        `processedStripeEvents/${event.id}`
+                    ).once("value");
+
+                if (processedSnapshot.exists())
+                {
+                    console.log("Duplicate Stripe event ignored.");
+
+                    return res.json({
+                        received: true,
+                        duplicate: true
+                    });
+                }
+
+                console.error("Employee record not found.");
+
+                return res.status(500).send(
+                    "Employee record not found"
+                );
+            }
+
+            console.log("--------------------------------");
+            console.log("PAYMENT SUCCESSFUL");
+            console.log("Employee:", EMPLOYEE_UID);
+            console.log("Amount: RM50");
+            console.log("Payment Status: PAID");
+            console.log("Permit Status: ACTIVE");
+            console.log("New Expiry:", result.snapshot
+                .child(`employees/${EMPLOYEE_UID}/expiryDate`)
+                .val());
+            console.log("--------------------------------");
+
+            return res.json({
+                received: true,
+                paymentProcessed: true
+            });
+        }
+        catch (error)
+        {
+            console.error(
+                "Payment processing error:",
+                error.message
+            );
+
+            return res.status(500).send(
+                "Payment processing failed"
+            );
+        }
+
+    }
+);
+
+// =====================================================
+// EXPRESS JSON MIDDLEWARE
 // =====================================================
 
 app.use(express.json());
 
 
 // =====================================================
-// UPDATE BLYNK
-// =====================================================
-
-async function updateBlynk(pin, value)
-{
-    const url =
-        `https://blynk.cloud/external/api/update?token=${BLYNK_AUTH_TOKEN}&${pin}=${encodeURIComponent(value)}`;
-
-    try
-    {
-        const response = await fetch(url);
-
-        const text = await response.text();
-
-        console.log("--------------------------------");
-        console.log(`Blynk ${pin} = ${value}`);
-        console.log(`HTTP Status: ${response.status}`);
-        console.log(`Response: ${text}`);
-        console.log("--------------------------------");
-
-        return response.ok;
-    }
-    catch (error)
-    {
-        console.error(
-            `Error updating Blynk ${pin}:`,
-            error.message
-        );
-
-        return false;
-    }
-}
-
-
-// =====================================================
-// INITIAL PAYMENT / PERMIT STATE
-// =====================================================
-
-async function setupPaymentSystem()
-{
-    console.log("");
-    console.log("================================");
-    console.log("SETTING UP PAYMENT SYSTEM");
-    console.log("================================");
-
-
-    // ================================================
-    // EMPLOYEE ID
-    // ================================================
-
-    await updateBlynk(
-        "v16",
-        "B3 9E 68 10"
-    );
-
-
-    // ================================================
-    // MONTHLY FEE
-    // ================================================
-
-    await updateBlynk(
-        "v17",
-        "50.00"
-    );
-
-
-    // ================================================
-    // PAYMENT STATUS
-    // ================================================
-
-    await updateBlynk(
-        "v18",
-        "UNPAID"
-    );
-
-
-    // ================================================
-    // PERMIT STATUS
-    // ================================================
-
-    await updateBlynk(
-        "v20",
-        "EXPIRED"
-    );
-
-
-    // ================================================
-    // EXPIRY DATE
-    // ================================================
-
-    const expiryDate = "26/08/2026";
-
-    await updateBlynk(
-        "v21",
-        expiryDate
-    );
-
-
-    // ================================================
-    // EXPIRED NOTIFICATION
-    // ================================================
-
-    const notificationUrl =
-        `https://blynk.cloud/external/api/logEvent` +
-        `?token=${BLYNK_AUTH_TOKEN}` +
-        `&code=permit_expired` +
-        `&description=${encodeURIComponent(
-            "Your employee parking permit has expired. Please renew your permit."
-        )}`;
-
-    try
-    {
-        const response =
-            await fetch(notificationUrl);
-
-        console.log("--------------------------------");
-        console.log("Permit expired notification sent");
-        console.log("HTTP Status:", response.status);
-        console.log("--------------------------------");
-    }
-    catch (error)
-    {
-        console.error(
-            "Error sending expired notification:",
-            error.message
-        );
-    }
-
-
-    console.log("");
-    console.log("================================");
-    console.log("PAYMENT SYSTEM READY");
-    console.log("Employee ID    : B3 9E 68 10");
-    console.log("Monthly Fee    : RM50.00");
-    console.log("Payment Status : UNPAID");
-    console.log("Permit Status  : EXPIRED");
-    console.log("Expiry Date    : 26/08/2026");
-    console.log("================================");
-}
-
-
-// =====================================================
-// RENEW EXPIRY DATE
-// =====================================================
-
-function renewExpiryDate()
-{
-    // Current demo expiry date
-
-    let expiryDay = 26;
-    let expiryMonth = 8;
-    let expiryYear = 2026;
-
-
-    // Add one month
-
-    expiryMonth++;
-
-
-    if (expiryMonth > 12)
-    {
-        expiryMonth = 1;
-        expiryYear++;
-    }
-
-
-    const day =
-        String(expiryDay).padStart(2, "0");
-
-    const month =
-        String(expiryMonth).padStart(2, "0");
-
-
-    return `${day}/${month}/${expiryYear}`;
-}
-
-
-// =====================================================
-// STRIPE WEBHOOK
-// =====================================================
-
-app.post("/webhook", async (req, res) =>
-{
-    const event = req.body;
-
-
-    console.log("");
-    console.log("================================");
-    console.log("STRIPE EVENT RECEIVED");
-    console.log("Event Type:", event.type);
-    console.log("================================");
-
-
-    // =================================================
-    // CHECKOUT PAYMENT COMPLETED
-    // =================================================
-
-    if (event.type === "checkout.session.completed")
-    {
-        const session =
-            event.data.object;
-
-
-        console.log("");
-        console.log("================================");
-        console.log("PAYMENT SUCCESSFUL");
-        console.log("Checkout Session:");
-        console.log(session.id);
-        console.log("================================");
-
-
-        // =============================================
-        // CREATE NEW EXPIRY DATE
-        // =============================================
-
-        const newExpiryDate =
-            renewExpiryDate();
-
-
-        console.log("");
-        console.log("Updating Blynk...");
-        console.log("V18 = PAID");
-        console.log("V20 = ACTIVE");
-        console.log("V21 =", newExpiryDate);
-
-
-        // =============================================
-        // UPDATE PAYMENT STATUS
-        // =============================================
-
-        const paymentUpdated =
-            await updateBlynk(
-                "v18",
-                "PAID"
-            );
-
-
-        // =============================================
-        // UPDATE PERMIT STATUS
-        // =============================================
-
-        const permitUpdated =
-            await updateBlynk(
-                "v20",
-                "ACTIVE"
-            );
-
-
-        // =============================================
-        // UPDATE EXPIRY DATE
-        // =============================================
-
-        const expiryUpdated =
-            await updateBlynk(
-                "v21",
-                newExpiryDate
-            );
-
-
-        // =============================================
-        // PAYMENT SUCCESS NOTIFICATION
-        // =============================================
-
-        const notificationUrl =
-            `https://blynk.cloud/external/api/logEvent` +
-            `?token=${BLYNK_AUTH_TOKEN}` +
-            `&code=payment_success` +
-            `&description=${encodeURIComponent(
-                "Payment successful. Your employee parking permit has been renewed."
-            )}`;
-
-
-        let notificationUpdated = false;
-
-
-        try
-        {
-            const response =
-                await fetch(notificationUrl);
-
-            notificationUpdated =
-                response.ok;
-
-            console.log("--------------------------------");
-            console.log("Payment success notification sent");
-            console.log(
-                "HTTP Status:",
-                response.status
-            );
-            console.log("--------------------------------");
-        }
-        catch (error)
-        {
-            console.error(
-                "Error sending payment notification:",
-                error.message
-            );
-        }
-
-
-        // =============================================
-        // CHECK RESULTS
-        // =============================================
-
-        console.log("");
-
-
-        if (
-            paymentUpdated &&
-            permitUpdated &&
-            expiryUpdated &&
-            notificationUpdated
-        )
-        {
-            console.log("================================");
-            console.log("BLYNK UPDATED SUCCESSFULLY");
-            console.log("Payment Status : PAID");
-            console.log("Permit Status  : ACTIVE");
-            console.log(
-                "Expiry Date    :",
-                newExpiryDate
-            );
-            console.log("Notification   : SENT");
-            console.log("================================");
-        }
-        else
-        {
-            console.log("================================");
-            console.log("BLYNK UPDATE PARTIALLY FAILED");
-
-            console.log(
-                "V18:",
-                paymentUpdated ? "OK" : "FAILED"
-            );
-
-            console.log(
-                "V20:",
-                permitUpdated ? "OK" : "FAILED"
-            );
-
-            console.log(
-                "V21:",
-                expiryUpdated ? "OK" : "FAILED"
-            );
-
-            console.log(
-                "Notification:",
-                notificationUpdated ? "OK" : "FAILED"
-            );
-
-            console.log("================================");
-        }
-    }
-
-
-    // =================================================
-    // SEND RESPONSE TO STRIPE
-    // =================================================
-
-    res.json({
-        received: true
-    });
-});
-
-// =====================================================
-// RESET PAYMENT FOR DEMO
-// =====================================================
-
-app.get("/reset-payment", async (req, res) => {
-    try {
-        await updateBlynk("v18", "UNPAID");
-        await updateBlynk("v20", "EXPIRED");
-        await updateBlynk("v21", "26/08/2026");
-
-        // Send permit expired notification
-        const eventUrl =
-            `https://blynk.cloud/external/api/logEvent?token=${BLYNK_AUTH_TOKEN}` +
-            `&code=permit_expired` +
-            `&description=${encodeURIComponent("Parking permit has expired. Please renew your monthly permit.")}`;
-
-        const response = await fetch(eventUrl);
-
-        console.log("Payment reset to UNPAID");
-        console.log("Permit expired notification sent");
-
-        res.send("Payment reset successfully: UNPAID / EXPIRED");
-    } catch (error) {
-        console.error("Reset payment error:", error);
-        res.status(500).send("Failed to reset payment");
-    }
-});
-// =====================================================
-// TEST BLYNK CONNECTION
-// =====================================================
-
-app.get("/test-blynk", async (req, res) =>
-{
-    const result =
-        await updateBlynk(
-            "v18",
-            "TEST"
-        );
-
-
-    if (result)
-    {
-        res.send(
-            "Blynk test successful"
-        );
-    }
-    else
-    {
-        res.status(500).send(
-            "Blynk test failed"
-        );
-    }
-});
-
-
-// =====================================================
 // SERVER
 // =====================================================
+const PORT = process.env.PORT || 4242;
 
-app.listen(4242, async () =>
+app.listen(PORT, async () => 
 {
     console.log("================================");
     console.log("Smart Parking Payment Backend");
-    console.log("Server running on port 4242");
+    console.log("Server running on port " + PORT);
     console.log("================================");
 
 
-    // Setup initial payment/permit state
-
-    await setupPaymentSystem();
 });
