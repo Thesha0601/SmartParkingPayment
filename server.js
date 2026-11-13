@@ -84,12 +84,21 @@ function addOneMonth(dateString)
 // STRIPE WEBHOOK - RAW BODY
 // =====================================================
 
+
+// =====================================================
+// STRIPE WEBHOOK - RAW BODY
+// =====================================================
+
 app.post(
     "/webhook",
     express.raw({ type: "application/json" }),
     async (req, res) => {
 
         let event;
+
+        // -------------------------------------------------
+        // VERIFY STRIPE SIGNATURE
+        // -------------------------------------------------
 
         try {
             const signature = req.headers["stripe-signature"];
@@ -101,7 +110,10 @@ app.post(
             );
 
         } catch (error) {
-            console.error("Stripe webhook verification failed:", error.message);
+            console.error(
+                "Stripe webhook verification failed:",
+                error.message
+            );
 
             return res.status(400).send(
                 `Webhook Error: ${error.message}`
@@ -110,38 +122,32 @@ app.post(
 
         console.log("Verified Stripe event:", event.type);
 
-       
-        // =====================================================
-        // PROCESS SUCCESSFUL STRIPE PAYMENT
-        // =====================================================
+        try {
 
-        try
-        {
-            // Only process completed Checkout Sessions
+            // -------------------------------------------------
+            // ONLY PROCESS COMPLETED CHECKOUT SESSIONS
+            // -------------------------------------------------
 
-            if (event.type !== "checkout.session.completed")
-            {
+            if (event.type !== "checkout.session.completed") {
                 return res.json({ received: true });
             }
 
             const session = event.data.object;
 
-            // Check successful payment
-
-            if (session.payment_status !== "paid")
-            {
+            if (session.payment_status !== "paid") {
                 console.log("Payment is not completed yet.");
                 return res.json({ received: true });
             }
 
-            // Check payment mode and amount
+            // -------------------------------------------------
+            // VALIDATE PAYMENT
+            // -------------------------------------------------
 
             if (
                 session.mode !== "payment" ||
                 session.amount_total !== MONTHLY_FEE_SEN ||
                 session.currency !== "myr"
-            )
-            {
+            ) {
                 console.error("Payment amount or currency is incorrect.");
 
                 return res.status(400).send(
@@ -149,106 +155,68 @@ app.post(
                 );
             }
 
-            // Get employee and payment information
-
-            const today = getMalaysiaDate();
-
-            const notificationKey =
-                db.ref("notifications").push().key;
+            // -------------------------------------------------
+            // STRIPE EVENT ID - DUPLICATE PROTECTION
+            // -------------------------------------------------
 
             const timestamp = Date.now();
 
-            // Update Firebase safely
+            const eventRef = db.ref(
+                `processedStripeEvents/${event.id}`
+            );
 
-            const result = await db.ref().transaction(
-                (data) =>
-                {
-                    if (!data)
-                    {
+            // Claim this event before processing it.
+            // A stale claim can be retried after 2 minutes.
+
+            const claimResult = await eventRef.transaction(
+                (current) => {
+
+                    if (
+                        current &&
+                        (
+                            current.status === "COMPLETED" ||
+                            current.processedAt
+                        )
+                    ) {
                         return;
                     }
 
-                    data.processedStripeEvents =
-                        data.processedStripeEvents || {};
-
-                    // Prevent duplicate payment processing
-
-                    if (data.processedStripeEvents[event.id])
-                    {
+                    if (
+                        current &&
+                        current.status === "PROCESSING" &&
+                        timestamp - (current.claimedAt || 0) < 120000
+                    ) {
                         return;
                     }
 
-                    const employee =
-                        data.employees?.[EMPLOYEE_UID];
-
-                    if (!employee)
-                    {
-                        return;
-                    }
-
-                    // Check whether existing permit is active
-
-                    const isActive =
-                        employee.permitStatus === "ACTIVE" &&
-                        typeof employee.expiryDate === "string" &&
-                        employee.expiryDate >= today;
-
-                    // Decide the starting date
-
-                    const baseDate = isActive
-                        ? employee.expiryDate
-                        : today;
-
-                    // Calculate new expiry date
-
-                    const newExpiryDate =
-                        addOneMonth(baseDate);
-
-                    // Update employee information
-
-                    employee.paymentStatus = "PAID";
-                    employee.permitStatus = "ACTIVE";
-                    employee.expiryDate = newExpiryDate;
-                    employee.lastPaymentDate = today;
-                    employee.updatedAt = timestamp;
-
-                    // Create payment notification
-
-                    data.notifications =
-                        data.notifications || {};
-
-                    data.notifications[notificationKey] = {
-                        employeeUID: EMPLOYEE_UID,
-                        type: "PAYMENT_SUCCESS",
-                        message: "Your RM50 monthly parking payment was successful. Your permit is now active.",
-                        date: today,
-                        timestamp: timestamp
+                    return {
+                        status: "PROCESSING",
+                        claimedAt: timestamp,
+                        checkoutSessionId: session.id
                     };
-
-                    // Record processed Stripe event
-
-                    data.processedStripeEvents[event.id] = {
-                        checkoutSessionId: session.id,
-                        processedAt: timestamp
-                    };
-
-                    return data;
                 },
                 undefined,
                 false
             );
 
-            // Check transaction result
+            // -------------------------------------------------
+            // CHECK WHETHER THIS EVENT WAS ALREADY PROCESSED
+            // -------------------------------------------------
 
-            if (!result.committed)
-            {
-                const processedSnapshot =
-                    await db.ref(
-                        `processedStripeEvents/${event.id}`
-                    ).once("value");
+            if (!claimResult.committed) {
 
-                if (processedSnapshot.exists())
-                {
+                const existingEvent =
+                    await eventRef.once("value");
+
+                const existingData = existingEvent.val();
+
+                if (
+                    existingData &&
+                    (
+                        existingData.status === "COMPLETED" ||
+                        existingData.processedAt
+                    )
+                ) {
                     console.log("Duplicate Stripe event ignored.");
 
                     return res.json({
@@ -257,12 +225,129 @@ app.post(
                     });
                 }
 
+                console.log("Stripe event is already being processed.");
+
+                return res.status(500).send(
+                    "Payment event is currently being processed. Retry later."
+                );
+            }
+
+            // -------------------------------------------------
+            // READ ONLY THE EMPLOYEE RECORD
+            // -------------------------------------------------
+
+            const employeeRef = db
+                .ref("employees")
+                .child(EMPLOYEE_UID);
+
+            const employeeSnapshot =
+                await employeeRef.once("value");
+
+            if (!employeeSnapshot.exists()) {
+
                 console.error("Employee record not found.");
+
+                await eventRef.remove();
 
                 return res.status(500).send(
                     "Employee record not found"
                 );
             }
+
+            const employee = employeeSnapshot.val();
+
+            const today = getMalaysiaDate();
+
+            // -------------------------------------------------
+            // PREVENT REPEATING AN ALREADY APPLIED PAYMENT
+            // -------------------------------------------------
+
+            const alreadyApplied =
+                employee.lastProcessedStripeEventId === event.id;
+
+            let newExpiryDate = employee.expiryDate;
+
+            if (!alreadyApplied) {
+
+                const isActive =
+                    employee.permitStatus === "ACTIVE" &&
+                    typeof employee.expiryDate === "string" &&
+                    employee.expiryDate >= today;
+
+                const baseDate = isActive
+                    ? employee.expiryDate
+                    : today;
+
+                newExpiryDate = addOneMonth(baseDate);
+            }
+
+            // -------------------------------------------------
+            // CREATE PAYMENT NOTIFICATION
+            // -------------------------------------------------
+
+            const notificationKey = `payment_${event.id}`;
+
+            const notification = {
+                employeeUID: EMPLOYEE_UID,
+                type: "PAYMENT_SUCCESS",
+                message: "Your RM50 monthly parking payment was successful. Your permit is now active.",
+                date: today,
+                timestamp: timestamp
+            };
+
+            // -------------------------------------------------
+            // UPDATE ONLY REQUIRED FIREBASE PATHS
+            // -------------------------------------------------
+
+            const updates = {};
+
+            if (!alreadyApplied) {
+
+                updates[
+                    `employees/${EMPLOYEE_UID}/paymentStatus`
+                ] = "PAID";
+
+                updates[
+                    `employees/${EMPLOYEE_UID}/permitStatus`
+                ] = "ACTIVE";
+
+                updates[
+                    `employees/${EMPLOYEE_UID}/expiryDate`
+                ] = newExpiryDate;
+
+                updates[
+                    `employees/${EMPLOYEE_UID}/lastPaymentDate`
+                ] = today;
+
+                updates[
+                    `employees/${EMPLOYEE_UID}/updatedAt`
+                ] = timestamp;
+
+                updates[
+                    `employees/${EMPLOYEE_UID}/lastProcessedStripeEventId`
+                ] = event.id;
+            }
+
+            // Create or recover the notification.
+            updates[
+                `notifications/${notificationKey}`
+            ] = notification;
+
+            // Mark the Stripe event as completed.
+            updates[
+                `processedStripeEvents/${event.id}`
+            ] = {
+                status: "COMPLETED",
+                checkoutSessionId: session.id,
+                processedAt: timestamp
+            };
+
+            // One atomic update. Other Firebase paths are untouched.
+            await db.ref().update(updates);
+
+            // -------------------------------------------------
+            // SUCCESS LOG
+            // -------------------------------------------------
 
             console.log("--------------------------------");
             console.log("PAYMENT SUCCESSFUL");
@@ -270,18 +355,16 @@ app.post(
             console.log("Amount: RM50");
             console.log("Payment Status: PAID");
             console.log("Permit Status: ACTIVE");
-            console.log("New Expiry:", result.snapshot
-                .child(`employees/${EMPLOYEE_UID}/expiryDate`)
-                .val());
+            console.log("New Expiry:", newExpiryDate);
             console.log("--------------------------------");
 
             return res.json({
                 received: true,
                 paymentProcessed: true
             });
-        }
-        catch (error)
-        {
+
+        } catch (error) {
+
             console.error(
                 "Payment processing error:",
                 error.message
@@ -291,9 +374,9 @@ app.post(
                 "Payment processing failed"
             );
         }
-
     }
 );
+
 
 // =====================================================
 // EXPRESS JSON MIDDLEWARE
