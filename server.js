@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const { cert, initializeApp } = require("firebase-admin/app");
 const { getDatabase } = require("firebase-admin/database");
+const { getAuth } = require("firebase-admin/auth");
 const Stripe = require("stripe");
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -25,6 +26,7 @@ const firebaseApp = initializeApp({
 });
 
 const db = getDatabase(firebaseApp);
+const auth = getAuth(firebaseApp);
 
 // =====================================================
 // EMPLOYEE PAYMENT SETTINGS
@@ -69,6 +71,7 @@ function addOneMonth(dateString)
 
     const nextMonth = month === 12 ? 1 : month + 1;
 
+    
     const nextYear = month === 12 ? year + 1 : year;
 
     const lastDay = new Date(
@@ -80,9 +83,7 @@ function addOneMonth(dateString)
     return `${nextYear}-${String(nextMonth).padStart(2, "0")}-${String(finalDay).padStart(2, "0")}`;
 }
 
-// =====================================================
-// STRIPE WEBHOOK - RAW BODY
-// =====================================================
+
 
 
 // =====================================================
@@ -386,8 +387,205 @@ app.use(express.json());
 
 
 // =====================================================
+// EMPLOYEE LOGIN
+// =====================================================
+
+app.post("/login", async (req, res) => {
+
+    try {
+        const { employeeId, password } = req.body;
+
+        // Check required fields
+        if (
+            typeof employeeId !== "string" ||
+            typeof password !== "string" ||
+            !employeeId.trim() ||
+            !password
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Employee ID and password are required."
+            });
+        }
+
+        // Find employee in Firebase Realtime Database
+        const employeeUID = employeeId.trim();
+
+        const employeeSnapshot = await db
+            .ref("employees")
+            .child(employeeUID)
+            .once("value");
+
+        if (!employeeSnapshot.exists()) {
+            return res.status(401).json({
+                success: false,
+                message: "Invalid Employee ID or password."
+            });
+        }
+
+        const employee = employeeSnapshot.val();
+
+        // Read the shared workplace parking information
+        const parkingSnapshot = await db
+            .ref("parking")
+            .once("value");
+
+        const parking = parkingSnapshot.val() || {};
+        
+        // Get the employee's registered login email
+        if (!employee.loginEmail) {
+            return res.status(400).json({
+                success: false,
+                message: "Employee login account is not configured."
+            });
+        }
+
+        // Check Firebase Web API Key
+        if (!process.env.FIREBASE_WEB_API_KEY) {
+            console.error("Firebase Web API Key is missing.");
+
+            return res.status(500).json({
+                success: false,
+                message: "Login service is not configured."
+            });
+        }
+
+        // Verify password using Firebase Authentication
+        const authResponse = await fetch(
+            `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${process.env.FIREBASE_WEB_API_KEY}`,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    email: employee.loginEmail,
+                    password: password,
+                    returnSecureToken: true
+                })
+            }
+        );
+
+        const authData = await authResponse.json();
+
+        if (!authResponse.ok) {
+            console.log("Employee login was unsuccessful.");
+
+            return res.status(401).json({
+                success: false,
+                message: "Invalid Employee ID or password."
+            });
+        }
+
+        // Return employee information after successful login
+        return res.json({
+            success: true,
+            message: "Login successful.",
+
+            idToken: authData.idToken,
+            refreshToken: authData.refreshToken,
+            expiresIn: authData.expiresIn,
+
+            employee: {
+                employeeId: employeeUID,
+                name: employee.name,
+                monthlyFee: employee.monthlyFee,
+                paymentStatus: employee.paymentStatus,
+                permitStatus: employee.permitStatus,
+                expiryDate: employee.expiryDate,
+                parking: parking
+            }
+        });
+
+    } catch (error) {
+
+        console.error("Login error:", error.message);
+
+        return res.status(500).json({
+            success: false,
+            message: "Unable to process login."
+        });
+    }
+});
+
+// =====================================================
+// AUTHENTICATE EMPLOYEE
+// =====================================================
+
+async function verifyEmployee(req, res, next) {
+    try {
+        const header = req.headers.authorization;
+
+        if (!header || !header.startsWith("Bearer ")) {
+            return res.status(401).json({
+                success: false,
+                message: "Authentication required."
+            });
+        }
+
+        const token = header.split(" ")[1];
+
+        const decodedToken = await auth.verifyIdToken(token);
+
+        const employeeSnapshot = await db
+            .ref("employees")
+            .orderByChild("loginEmail")
+            .equalTo(decodedToken.email)
+            .limitToFirst(1)
+            .once("value");
+
+        if (!employeeSnapshot.exists()) {
+            return res.status(403).json({
+                success: false,
+                message: "Employee account not found."
+            });
+        }
+
+        const employeeUID = Object.keys(employeeSnapshot.val())[0];
+
+        req.employeeUID = employeeUID;
+
+        next();
+
+    } catch (error) {
+        console.error("Authentication error:", error.message);
+
+        return res.status(401).json({
+            success: false,
+            message: "Invalid or expired login."
+        });
+    }
+}
+
+
+
+// =====================================================
+// GET PARKING STATUS
+// =====================================================
+
+app.get("/parking", verifyEmployee, async (req, res) => {
+    try {
+        const snapshot = await db.ref("parking").once("value");
+
+        return res.json({
+            success: true,
+            parking: snapshot.val() || {}
+        });
+
+    } catch (error) {
+        console.error("Parking read error:", error.message);
+
+        return res.status(500).json({
+            success: false,
+            message: "Unable to retrieve parking status."
+        });
+    }
+});
+
+// =====================================================
 // SERVER
 // =====================================================
+
 const PORT = process.env.PORT || 4242;
 
 
