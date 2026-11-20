@@ -566,13 +566,42 @@ async function verifyEmployee(req, res, next) {
 // GET PARKING STATUS
 // =====================================================
 
+
 app.get("/parking", verifyEmployee, async (req, res) => {
     try {
-        const snapshot = await db.ref("parking").once("value");
+        // Get the latest employee information from Firebase
+        const employeeSnapshot = await db
+            .ref("employees")
+            .child(req.employeeUID)
+            .once("value");
+
+        if (!employeeSnapshot.exists()) {
+            return res.status(404).json({
+                success: false,
+                message: "Employee record not found."
+            });
+        }
+
+        const employee = employeeSnapshot.val();
+
+        // Get the latest parking information
+        const parkingSnapshot = await db
+            .ref("parking")
+            .once("value");
 
         return res.json({
             success: true,
-            parking: snapshot.val() || {}
+
+            employee: {
+                employeeId: req.employeeUID,
+                name: employee.name,
+                monthlyFee: employee.monthlyFee,
+                paymentStatus: employee.paymentStatus,
+                permitStatus: employee.permitStatus,
+                expiryDate: employee.expiryDate
+            },
+
+            parking: parkingSnapshot.val() || {}
         });
 
     } catch (error) {
@@ -584,6 +613,7 @@ app.get("/parking", verifyEmployee, async (req, res) => {
         });
     }
 });
+
 
 
 // GET EMPLOYEE NOTIFICATIONS
