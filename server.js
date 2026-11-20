@@ -393,6 +393,9 @@ app.use(express.json());
 app.post("/login", async (req, res) => {
 
     try {
+        console.log("LOGIN BODY KEYS:", Object.keys(req.body || {}));
+        console.log("EMPLOYEE ID TYPE:", typeof req.body?.employeeId);
+        console.log("PASSWORD TYPE:", typeof req.body?.password);
         const { employeeId, password } = req.body;
 
         // Check required fields
