@@ -585,6 +585,40 @@ app.get("/parking", verifyEmployee, async (req, res) => {
     }
 });
 
+
+// GET EMPLOYEE NOTIFICATIONS
+app.get("/notifications", verifyEmployee, async (req, res) => {
+  try {
+    const snapshot = await db.ref("notifications").once("value");
+    const allNotifications = snapshot.val() || {};
+
+    const employeeNotifications = Object.entries(allNotifications)
+      .filter(([key, notification]) =>
+        notification &&
+        notification.employeeUID === req.employeeUID
+      )
+      .map(([id, notification]) => ({
+        id,
+        ...notification
+      }))
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+    return res.json({
+      success: true,
+      notifications: employeeNotifications.slice(0, 1)
+    });
+
+  } catch (error) {
+    console.error("Notification read error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to retrieve notifications."
+    });
+  }
+});
+
+
 // =====================================================
 // SERVER
 // =====================================================
